@@ -1,4 +1,4 @@
-package pcloud
+package go_pcloud
 
 import (
 	"bytes"
@@ -33,6 +33,29 @@ func (pc *PCloud) UserInfo() (map[string]any, error) {
 	endpoint := "/userinfo"
 	ctx := context.Background()
 	return pc.execute(ctx, http.MethodGet, endpoint, nil, nil)
+}
+
+func (pc *PCloud) ListFolder(path string) ([]string, error) {
+	endpoint := "/listfolder"
+	query := map[string]string{
+		"path": path,
+	}
+	ctx := context.Background()
+	response, err := pc.execute(ctx, http.MethodGet, endpoint, nil, query)
+	if err != nil {
+		return nil, err
+	}
+	// convert the response to a list of paths
+	content, ok := response["metadata"].(map[string]any)["contents"]
+	if !ok {
+		return nil, fmt.Errorf("unable to get content for \"%s\"", path)
+	}
+	output := []string{}
+	for _, item := range content.([]interface{}) {
+		item := item.(map[string]any)
+		output = append(output, item["path"].(string))
+	}
+	return output, nil
 }
 
 func (pc *PCloud) UploadFile(path, filename string, data []byte) (map[string]any, error) {
@@ -74,35 +97,38 @@ func (pc *PCloud) OpenFile(fullPath string) (string, error) {
 	return fmt.Sprintf("%.0f", fd), nil
 }
 
-func (pc *PCloud) WriteFile(ctx context.Context, fd string, r io.Reader, chunkSize int) error {
+func (pc *PCloud) FileStat(fullPath string) (map[string]any, error) {
+	endpoint := "/stat"
+	query := map[string]string{
+		"path": fullPath,
+	}
+	ctx := context.Background()
+	return pc.execute(ctx, http.MethodGet, endpoint, nil, query)
+}
+
+func (pc *PCloud) ReadFile(ctx context.Context, fd string, chunkSize int) ([]byte, error) {
+	endpoint := "/file_read"
+	query := map[string]string{
+		"fd":    fd,
+		"count": fmt.Sprintf("%d", chunkSize),
+	}
+	return pc.executeRaw(ctx, http.MethodGet, endpoint, nil, query)
+}
+
+func (pc *PCloud) WriteFile(ctx context.Context, fd string, buf []byte) (int, error) {
 	endpoint := "/file_write"
 	query := map[string]string{
 		"fd": fd,
 	}
-	if chunkSize == 0 {
-		chunkSize = 1024 * 1024
+	response, err := pc.execute(ctx, http.MethodPut, endpoint, bytes.NewReader(buf), query)
+	if err != nil {
+		return 0, nil
 	}
-
-	size := 0
-	chunk := []byte{}
-	for {
-		buf := make([]byte, chunkSize)
-		n, err := r.Read(buf)
-		if err == io.EOF {
-			return nil
-		}
-		chunk = append(chunk, buf[:n]...)
-		if len(chunk) < chunkSize {
-			continue
-		}
-		_, err = pc.execute(ctx, http.MethodPut, endpoint, bytes.NewBuffer(chunk), query)
-		if err != nil {
-			return err
-		}
-		chunk = []byte{}
-		size += n
-		fmt.Printf("%s: %.2fMB\r", fd, float64(size)/(1024*1024))
+	n, ok := response["bytes"].(float64)
+	if !ok {
+		return 0, fmt.Errorf("unable to get written bytes")
 	}
+	return int(n), nil
 }
 
 func (pc *PCloud) CloseFile(fd string) error {
@@ -111,21 +137,20 @@ func (pc *PCloud) CloseFile(fd string) error {
 		"fd": fd,
 	}
 	ctx := context.Background()
-	data, err := pc.execute(ctx, http.MethodGet, endpoint, nil, query)
+	_, err := pc.execute(ctx, http.MethodGet, endpoint, nil, query)
 	if err != nil {
 		return err
 	}
-	fmt.Println(data)
 	return nil
 }
 
-func (pc *PCloud) execute(
+func (pc *PCloud) executeRaw(
 	ctx context.Context,
 	method,
 	endpoint string,
 	body io.Reader,
 	params map[string]string,
-) (map[string]any, error) {
+) ([]byte, error) {
 	url := pc.baseUrl + endpoint
 	req, err := http.NewRequestWithContext(ctx, method, url, body)
 	if err != nil {
@@ -154,8 +179,17 @@ func (pc *PCloud) execute(
 			resp.Status,
 		)
 	}
+	return io.ReadAll(resp.Body)
+}
 
-	respBody, err := io.ReadAll(resp.Body)
+func (pc *PCloud) execute(
+	ctx context.Context,
+	method,
+	endpoint string,
+	body io.Reader,
+	params map[string]string,
+) (map[string]any, error) {
+	respBody, err := pc.executeRaw(ctx, method, endpoint, body, params)
 	if err != nil {
 		return nil, err
 	}
@@ -170,7 +204,7 @@ func (pc *PCloud) execute(
 	if ok && result.(float64) != float64(0) {
 		return nil, fmt.Errorf(
 			"error on request to %s with result \"%.0f\" and error \"%s\"",
-			url,
+			endpoint,
 			result.(float64),
 			data["error"],
 		)
